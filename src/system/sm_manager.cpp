@@ -198,7 +198,25 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @param {Context*} context
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    
+    TabMeta &tab = db_.get_table(tab_name);
+    std::vector<ColMeta> index_cols;
+    for (auto &col_name : col_names) {
+        index_cols.push_back(*tab.get_col(col_name));
+    }
+    if (ix_manager_->exists(tab_name, index_cols)) {
+        throw IndexExistsError(tab_name, col_names);
+    }
+    ix_manager_->create_index(tab_name, index_cols);
+    IndexMeta index_meta;
+    index_meta.tab_name = tab_name;
+    index_meta.col_num = index_cols.size();
+    int col_tot_len = 0;
+    for (auto &col : index_cols) {
+        col_tot_len += col.len;
+    }
+    index_meta.col_tot_len = col_tot_len;
+    index_meta.cols = index_cols;
+    tab.indexes.push_back(index_meta);
 }
 
 /**
@@ -208,7 +226,14 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    
+    TabMeta &tab = db_.get_table(tab_name);
+    std::vector<ColMeta> index_cols;
+    for (auto &col_name : col_names) {
+        index_cols.push_back(*tab.get_col(col_name));
+    }
+    ix_manager_->destroy_index(tab_name, index_cols);
+    auto index_it = tab.get_index_meta(col_names);
+    tab.indexes.erase(index_it);
 }
 
 /**
@@ -218,5 +243,12 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
-    
+    ix_manager_->destroy_index(tab_name, cols);
+    TabMeta &tab = db_.get_table(tab_name);
+    std::vector<std::string> col_names;
+    for (auto &col : cols) {
+        col_names.push_back(col.name);
+    }
+    auto index_it = tab.get_index_meta(col_names);
+    tab.indexes.erase(index_it);
 }
