@@ -29,3 +29,6 @@ __pycache__/
 *.zip
 
 deps/
+
+# 学习文档
+项目说明.md
