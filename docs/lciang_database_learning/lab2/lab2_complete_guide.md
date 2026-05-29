@@ -280,77 +280,28 @@ page_id_t IxNodeHandle::internal_lookup(const char *key) {
 
 **为什么是 upper_bound + idx-1，以及 idx==0 的处理**：
 
-`upper_bound` 文档说返回范围是 `[1, num_key)`，但实际当 target 小于所有 key 时，二分查找使 `left=0` 不变，最终返回 0。此时 `value_at(-1)` 会段错误。target < key[0] 表示它属于第一个子树（rid[0]），所以直接 `return value_at(0)`。
+根据 RucBase 文档："在每个内部结点的第一个值前面额外加上第一个键"，所以内部节点的实际布局是：
 
-举例，假设内部节点有 key = [5, 10, 15]，子节点 = [A, B, C, D]：
-- 子树 A 的键 < 5
-- 子树 B 的键 >= 5 且 < 10
-- 子树 C 的键 >= 10 且 < 15
-- 子树 D 的键 >= 15
+```
+rid[0]  key[0]  rid[1]  key[1]  rid[2]  key[2]  ...
+  ↑       ↑       ↑       ↑       ↑
+第一个   第一个   第二个   分隔键   第三个
+子节点   子节点   子节点           子节点
+         最小key
+```
 
-查找 key = 7：
-- `upper_bound(7)` 返回 1（第一个 > 7 的是 key[1]=10）
-- `value_at(0)` 返回子节点 A 的 page_no（不对！应该是 B）
+- `key[0]` 是额外加的，存储第一个子节点中所有 key 的最小值
+- `key[i]` (i>0) 是分隔键，`rid[i]` 指向 key[i] 右边的子节点（键 >= key[i]）
+- `rid[0]` 指向第一个子节点（键 < key[1]）
 
-等等，这里需要重新理解。实际上内部节点的布局是：
-- `value[0]` 指向第一个子树（键 < key[0]）
-- `value[1]` 指向第二个子树（键 >= key[0] 且 < key[1]）
-- ...
+查找逻辑：
+- `upper_bound(target)` 返回第一个 > target 的位置 idx
+- 当 `idx > 0`：target 在 key[idx-1] 和 key[idx] 之间，属于子节点 `rid[idx-1]`
+- 当 `idx == 0`：target < 所有 key，属于第一个子节点 `rid[0]`（不处理会 `value_at(-1)` 段错误）
 
-查找 key = 7：
-- `upper_bound(7)` 返回 1（key[1]=10 > 7）
-- `value_at(1-1) = value_at(0)` → 这不对
-
-实际上根据文档说明：**"内部结点每个key右边的value指向的孩子结点中的键均大于等于该key"**，所以：
-- `value[0]` 对应 key[0] 左边，键 < key[0]
-- `value[1]` 对应 key[0] 右边 = key[1] 左边，键 >= key[0] 且 < key[1]
-- ...
-
-查找 key = 7：
-- `upper_bound(7)` 返回 1（key[1]=10 > 7）
-- `value_at(1-1) = value_at(0)` → 子树键 < 5，不对
-
-实际上更准确的理解是：`upper_bound` 返回的位置就是应该走的子节点索引。但文档说 `value[i]` 是 key[i] 右边的值。让我重新理解：
-
-根据文档："内部结点每个key右边的value指向的孩子结点中的键均大于等于该key，每个key左边的value指向的孩子结点中的键均小于该key"
-
-所以布局是：`[value0, key0, value1, key1, value2, ...]`
-- value0：键 < key0
-- value1：键 >= key0 且 < key1
-- value2：键 >= key1
-
-查找 key=7，key=[5,10,15]：
+示例：key=[min, 10, 15]，查找 key=7：
 - `upper_bound(7)` = 1（key[1]=10 > 7）
-- `value_at(1-1) = value_at(0)` → 键 < 5，不对
-
-应该是 `value_at(upper_bound(7))` = `value_at(1)` → 键 >= 5 且 < 10，对了！
-
-但代码写的是 `value_at(idx - 1)`... 让我再看看。
-
-实际上根据 IxNodeHandle 的实现，key 和 rid 是一一对应的。`get_rid(i)` 和 `get_key(i)` 对应同一个位置。所以：
-
-- rid[0] 对应 key[0]，表示 key[0] 右边的子节点
-- rid[1] 对应 key[1]，表示 key[1] 右边的子节点
-- ...
-
-那第一个子节点（key < key[0]）在哪里？实际上根据文档的第(3)点："在每个结点的第一个值前面额外加上第一个键"，所以 rid[0] 就是第一个子节点（键 < key[0] 的子树），rid[1] 是 key[0] 右边的子节点（键 >= key[0]）。
-
-等等不对，文档说"为了做到这一点，在每个内部结点的第一个值前面额外加上第一个键"，这说明 key[0] 是额外加的，它存储的是第一个子节点中所有 key 的最小值。
-
-所以实际布局是：
-- rid[0]：第一个子节点（键 < key[1]）
-- key[0]：第一个子节点的最小 key
-- rid[1]：第二个子节点（键 >= key[1] 且 < key[2]）
-- key[1]：分隔键
-- rid[2]：第三个子节点（键 >= key[2]）
-- key[2]：分隔键
-- ...
-
-查找 key=7，key=[min, 10, 15]：
-- `upper_bound(7)` = 1（key[1]=10 > 7）
-- `value_at(1-1) = value_at(0)` → 第一个子节点（键 < 10），对了！
-
-好的，所以 `value_at(idx - 1)` 是正确的。代码没问题。
+- `value_at(1-1) = value_at(0)` → 第一个子节点（键 < 10），正确！
 
 ---
 
@@ -602,7 +553,7 @@ IxNodeHandle *IxIndexHandle::split(IxNodeHandle *node) {
     new_node->insert_pairs(0, node->get_key(split_key), node->get_rid(split_key), right_size);
 
     // 4. 初始化新节点的 page header
-    new_node->set_size(right_size);
+    // insert_pairs 已经将 num_key 增加了 right_size，无需再调用 set_size
     new_node->set_parent_page_no(node->get_parent_page_no());
 
     // 5. 旧节点只保留左半部分，缩小 size 即可
@@ -1058,7 +1009,14 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     // 4. 创建索引文件
     ix_manager_->create_index(tab_name, index_cols);
     // 5. 更新表的元数据
-    tab.indexes.push_back({tab_name, index_cols});
+    IndexMeta index_meta;
+    index_meta.tab_name = tab_name;
+    index_meta.col_num = index_cols.size();
+    int col_tot_len = 0;
+    for (auto &col : index_cols) col_tot_len += col.len;
+    index_meta.col_tot_len = col_tot_len;
+    index_meta.cols = index_cols;
+    tab.indexes.push_back(index_meta);
 }
 ```
 
@@ -1078,7 +1036,8 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
     // 删除索引文件
     ix_manager_->destroy_index(tab_name, index_cols);
     // 从表元数据中移除
-    tab.erase_index(tab_name, col_names);
+    auto index_it = tab.get_index_meta(col_names);
+    tab.indexes.erase(index_it);
 }
 ```
 
@@ -1093,7 +1052,8 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMet
     for (auto &col : cols) {
         col_names.push_back(col.name);
     }
-    tab.erase_index(tab_name, col_names);
+    auto index_it = tab.get_index_meta(col_names);
+    tab.indexes.erase(index_it);
 }
 ```
 

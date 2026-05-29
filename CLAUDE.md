@@ -113,8 +113,8 @@ Each data page: [RmPageHdr][bitmap][slots]. `RmPageHandle` provides typed access
 
 Functions with `// Todo:` stubs in the source files are student exercises. Do not implement them unless explicitly asked. The labs are:
 
-1. **Lab1 - Storage**: DiskManager, LRUReplacer, BufferPoolManager, RmFileHandle, RmScan
-2. **Lab2 - Index**: B+ tree insert/delete/scan
+1. **Lab1 - Storage**: DiskManager, LRUReplacer, BufferPoolManager, RmFileHandle, RmScan (27 TODOs, currently STUBS)
+2. **Lab2 - Index**: B+ tree insert/delete/scan (22 TODOs, COMPLETED — src/system/sm_manager.cpp:3, src/index/ix_index_handle.cpp:20)
 3. **Lab3 - Query Execution**: Executor operators
 4. **Lab4 - Concurrency**: Transaction/lock management
 
@@ -136,14 +136,35 @@ Functions with `// Todo:` stubs in the source files are student exercises. Do no
 
 ## Known Issues
 
+### General
 - `src/common/config.h` uses `std::string` but is missing `#include <string>`. If you get `'string' in namespace 'std' does not name a type` errors, add `#include <string>` to that file.
 - `DiskManager::open_file` must check `is_file(path)` before calling `open()` and throw `FileNotFoundError` (not `UnixError`) if the file doesn't exist. The test expects this specific exception type.
+
+### Lab2 B+ Tree Pitfalls (5 bugs found during implementation)
+
+These are NOT in the learning guide — they were discovered during debugging:
+
+1. **`create_node()` parent is 0, not -1**: `BufferPoolManager::new_page` → `update_page` → `reset_memory` zeros the page. `IxPageHdr.parent` becomes 0, but `INVALID_PAGE_ID = -1`. `is_root_page()` checks `parent == INVALID_PAGE_ID` (0 == -1 → false). Fix: `new_root->set_parent_page_no(IX_NO_PAGE)` in `insert_into_parent` when creating a new root.
+
+2. **`coalesce_or_redistribute` leaks pin when root doesn't need adjustment**: `adjust_root` returns false without unpinning the root node. Each delete leaks one pin → buffer pool exhaustion → deadlock. Fix: unpin manually when `adjust_root` returns false.
+
+3. **`internal_lookup` out-of-bounds**: `upper_bound` can return 0 when target < all keys, causing `value_at(-1)`. Fix: check `if (idx == 0) return value_at(0)`.
+
+4. **Missing `maintain_parent` after modify-first-key**: `insert_entry` and `delete_entry` must call `maintain_parent(leaf)` after modifying the leaf's first key (insert at pos 0 or remove pos 0), otherwise parent's separator key becomes stale → `check_tree` assertion fails.
+
+5. **Concurrent control required**: `b_plus_tree_concurrent_test` fails without locking. Use `std::scoped_lock lock{root_latch_}` in `get_value`, `insert_entry`, `delete_entry`. `root_latch_` is an existing `std::mutex` member of `IxIndexHandle`.
+
+### Lab2 Order of Operations
+- Implement `SmManager::create_index` before running any index tests
+- Implement in dependency order: IxNodeHandle (8 TODOs) → IxIndexHandle lookup (2) → insert (3) → delete (5) → range scan (2) → concurrency (3 locks)
+- After each group, rebuild and test the corresponding test binary
 
 ## Learning Documents
 
 The `docs/lciang_database_learning/` directory contains complete implementation guides for each lab with directly copyable code:
 - `lab1/lab1_complete_guide.md` — Storage management (DiskManager, LRUReplacer, BPM, RmFileHandle, RmScan)
-- `lab2/lab2_complete_guide.md` — B+ tree index (22 TODOs)
+- `lab2/lab2_complete_guide.md` — B+ tree index (22 TODOs, includes 5 bug fixes)
+- `lab2/lab2作业.docx` — Lab2 experiment report (module intro, background, implementation, testing, bugs, summary)
 - `项目说明.md` — Project overview
 - `rucbase_learning_guide.md` — General learning guide
 
