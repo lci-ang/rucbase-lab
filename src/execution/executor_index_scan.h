@@ -34,6 +34,36 @@ class IndexScanExecutor : public AbstractExecutor {
 
     SmManager *sm_manager_;
 
+    bool evaluate_condition(const Condition &cond, RmRecord *record) {
+        auto lhs_col = tab_.get_col(cond.lhs_col.col_name);
+        char *lhs_data = record->data + lhs_col->offset;
+        char *rhs_data = nullptr;
+        if (cond.is_rhs_val) {
+            rhs_data = cond.rhs_val.raw->data;
+        } else {
+            auto rhs_col = tab_.get_col(cond.rhs_col.col_name);
+            rhs_data = record->data + rhs_col->offset;
+        }
+        int cmp = 0;
+        if (lhs_col->type == TYPE_INT) {
+            cmp = *(int *)lhs_data - *(int *)rhs_data;
+        } else if (lhs_col->type == TYPE_FLOAT) {
+            float l = *(float *)lhs_data, r = *(float *)rhs_data;
+            cmp = (l < r) ? -1 : ((l > r) ? 1 : 0);
+        } else if (lhs_col->type == TYPE_STRING) {
+            cmp = memcmp(lhs_data, rhs_data, lhs_col->len);
+        }
+        switch (cond.op) {
+            case OP_EQ: return cmp == 0;
+            case OP_NE: return cmp != 0;
+            case OP_LT: return cmp < 0;
+            case OP_GT: return cmp > 0;
+            case OP_LE: return cmp <= 0;
+            case OP_GE: return cmp >= 0;
+            default: return false;
+        }
+    }
+
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
                     Context *context) {
@@ -65,16 +95,78 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
-        
+        auto ih = sm_manager_->ihs_.at(
+            sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)
+        ).get();
+
+        Iid lower = ih->leaf_begin();
+        Iid upper = ih->leaf_end();
+
+        for (auto &cond : fed_conds_) {
+            if (cond.is_rhs_val && cond.op == OP_EQ &&
+                cond.lhs_col.tab_name == tab_name_ &&
+                tab_.is_col(cond.lhs_col.col_name)) {
+                bool is_index_col = false;
+                for (auto &idx_col : index_meta_.cols) {
+                    if (idx_col.name == cond.lhs_col.col_name) {
+                        is_index_col = true;
+                        break;
+                    }
+                }
+                if (is_index_col) {
+                    // cond.rhs_val.raw 已在 analyze 阶段初始化，直接使用
+                    lower = ih->lower_bound(cond.rhs_val.raw->data);
+                    upper = ih->upper_bound(cond.rhs_val.raw->data);
+                    break;
+                }
+            }
+        }
+
+        scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
+
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto record = fh_->get_record(rid_, context_);
+            bool match = true;
+            for (auto &cond : fed_conds_) {
+                if (!evaluate_condition(cond, record.get())) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return;
+            scan_->next();
+        }
     }
 
     void nextTuple() override {
-        
+        scan_->next();
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto record = fh_->get_record(rid_, context_);
+            bool match = true;
+            for (auto &cond : fed_conds_) {
+                if (!evaluate_condition(cond, record.get())) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return;
+            scan_->next();
+        }
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        return fh_->get_record(rid_, context_);
     }
+
+    bool is_end() const override {
+        return scan_->is_end();
+    }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
 
     Rid &rid() override { return rid_; }
 };

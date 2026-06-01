@@ -30,6 +30,37 @@ class SeqScanExecutor : public AbstractExecutor {
 
     SmManager *sm_manager_;
 
+    bool evaluate_condition(const Condition &cond, RmRecord *record) {
+        auto lhs_col = get_col(cols_, cond.lhs_col);
+        char *lhs_data = record->data + lhs_col->offset;
+        char *rhs_data = nullptr;
+        if (cond.is_rhs_val) {
+            // cond.rhs_val.raw 已在 analyze 阶段初始化，直接使用
+            rhs_data = cond.rhs_val.raw->data;
+        } else {
+            auto rhs_col = get_col(cols_, cond.rhs_col);
+            rhs_data = record->data + rhs_col->offset;
+        }
+        int cmp = 0;
+        if (lhs_col->type == TYPE_INT) {
+            cmp = *(int *)lhs_data - *(int *)rhs_data;
+        } else if (lhs_col->type == TYPE_FLOAT) {
+            float l = *(float *)lhs_data, r = *(float *)rhs_data;
+            cmp = (l < r) ? -1 : ((l > r) ? 1 : 0);
+        } else if (lhs_col->type == TYPE_STRING) {
+            cmp = memcmp(lhs_data, rhs_data, lhs_col->len);
+        }
+        switch (cond.op) {
+            case OP_EQ: return cmp == 0;
+            case OP_NE: return cmp != 0;
+            case OP_LT: return cmp < 0;
+            case OP_GT: return cmp > 0;
+            case OP_LE: return cmp <= 0;
+            case OP_GE: return cmp >= 0;
+            default: return false;
+        }
+    }
+
    public:
     SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context) {
         sm_manager_ = sm_manager;
@@ -50,7 +81,20 @@ class SeqScanExecutor : public AbstractExecutor {
      *
      */
     void beginTuple() override {
-        
+        scan_ = std::make_unique<RmScan>(fh_);
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto record = fh_->get_record(rid_, context_);
+            bool match = true;
+            for (auto &cond : fed_conds_) {
+                if (!evaluate_condition(cond, record.get())) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return;
+            scan_->next();
+        }
     }
 
     /**
@@ -58,7 +102,20 @@ class SeqScanExecutor : public AbstractExecutor {
      *
      */
     void nextTuple() override {
-        
+        scan_->next();
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto record = fh_->get_record(rid_, context_);
+            bool match = true;
+            for (auto &cond : fed_conds_) {
+                if (!evaluate_condition(cond, record.get())) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return;
+            scan_->next();
+        }
     }
 
     /**
@@ -67,8 +124,16 @@ class SeqScanExecutor : public AbstractExecutor {
      * @return std::unique_ptr<RmRecord>
      */
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        return fh_->get_record(rid_, context_);
     }
+
+    bool is_end() const override {
+        return scan_->is_end();
+    }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
 
     Rid &rid() override { return rid_; }
 };

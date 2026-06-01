@@ -85,7 +85,23 @@ void SmManager::drop_db(const std::string& db_name) {
  * @param {string&} db_name 数据库名称，与文件夹同名
  */
 void SmManager::open_db(const std::string& db_name) {
-    
+    // 读取数据库元数据（db.meta 在数据库目录内，需用完整路径）
+    std::string meta_path = db_name + "/" + DB_META_NAME;
+    std::ifstream ifs(meta_path);
+    ifs >> db_;
+    // 打开每张表的记录文件和索引文件
+    for (auto &entry : db_.tabs_) {
+        auto &tab_name = entry.first;
+        fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
+        for (auto &index : entry.second.indexes) {
+            auto index_name = ix_manager_->get_index_name(tab_name, index.cols);
+            ihs_.emplace(index_name, ix_manager_->open_index(tab_name, index.cols));
+        }
+    }
+    // 进入数据库目录（必须在打开文件之后）
+    if (chdir(db_name.c_str()) < 0) {
+        throw UnixError();
+    }
 }
 
 /**
@@ -101,7 +117,19 @@ void SmManager::flush_meta() {
  * @description: 关闭数据库并把数据落盘
  */
 void SmManager::close_db() {
-    
+    flush_meta();
+    for (auto &entry : fhs_) {
+        rm_manager_->close_file(entry.second.get());
+    }
+    for (auto &entry : ihs_) {
+        ix_manager_->close_index(entry.second.get());
+    }
+    db_.tabs_.clear();
+    fhs_.clear();
+    ihs_.clear();
+    if (chdir("..") < 0) {
+        throw UnixError();
+    }
 }
 
 /**
@@ -188,7 +216,15 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
  * @param {Context*} context
  */
 void SmManager::drop_table(const std::string& tab_name, Context* context) {
-    
+    TabMeta &tab = db_.get_table(tab_name);
+    rm_manager_->close_file(fhs_.at(tab_name).get());
+    rm_manager_->destroy_file(tab_name);
+    for (auto &index : tab.indexes) {
+        ix_manager_->destroy_index(tab_name, index.cols);
+    }
+    db_.tabs_.erase(tab_name);
+    fhs_.erase(tab_name);
+    flush_meta();
 }
 
 /**

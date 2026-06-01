@@ -163,8 +163,11 @@ delete[] key;
 
 ```cpp
 void SmManager::open_db(const std::string& db_name) {
-    // 读取数据库元数据
-    std::ifstream ifs(DB_META_NAME);
+    // 读取数据库元数据（db.meta 在数据库目录内，需用完整路径）
+    // ⚠️ 不能直接用 DB_META_NAME，因为当前目录是 build/ 而非数据库目录
+    // 否则 ifstream 打开失败 → operator>> 读到未初始化的 n → 死循环耗尽 CPU
+    std::string meta_path = db_name + "/" + DB_META_NAME;
+    std::ifstream ifs(meta_path);
     ifs >> db_;
     // 打开每张表的记录文件和索引文件
     for (auto &entry : db_.tabs_) {
@@ -249,12 +252,10 @@ bool evaluate_condition(const Condition &cond, RmRecord *record) {
     char *lhs_data = record->data + lhs_col->offset;
 
     char *rhs_data = nullptr;
-    Value rhs_val;
     if (cond.is_rhs_val) {
-        // 右值是常量，必须调用 init_raw 序列化为原始字节
-        rhs_val = cond.rhs_val;
-        rhs_val.init_raw(lhs_col->len);
-        rhs_data = rhs_val.raw->data;
+        // ⚠️ cond.rhs_val.raw 已在 analyze 阶段的 check_clause() 中初始化
+        // 不能复制 cond.rhs_val 后再调用 init_raw()，否则断言 raw == nullptr 失败
+        rhs_data = cond.rhs_val.raw->data;
     } else {
         // 右值是另一列
         auto rhs_col = get_col(cols_, cond.rhs_col);
@@ -285,7 +286,7 @@ bool evaluate_condition(const Condition &cond, RmRecord *record) {
 ```
 
 **三个陷阱**：
-1. `rhs_val.init_raw(lhs_col->len)` 必须调用！否则 `raw` 为 null → segfault
+1. **不能复制 `cond.rhs_val` 后再调用 `init_raw()`**！`cond.rhs_val.raw` 已在 `analyze.cpp:147` 的 `check_clause()` 中初始化。复制后 `raw` 不为 null，再调用 `init_raw()` 会触发 `assert(raw == nullptr)` 崩溃。正确做法：直接用 `cond.rhs_val.raw->data`
 2. 字符串用 `memcmp` + `lhs_col->len`，不能用 `strcmp`
 3. `get_col()` 是 AbstractExecutor 的 protected 方法，直接调用即可
 
@@ -560,9 +561,8 @@ std::unique_ptr<RmRecord> Next() override {
         memcpy(new_record.data, old_record->data, old_record->size);
         for (auto &clause : set_clauses_) {
             auto col = tab_.get_col(clause.lhs.col_name);
-            Value val = clause.rhs;
-            val.init_raw(col->len);
-            memcpy(new_record.data + col->offset, val.raw->data, col->len);
+            // clause.rhs.raw 已在 analyze 阶段初始化，直接使用
+            memcpy(new_record.data + col->offset, clause.rhs.raw->data, col->len);
         }
         // 从索引删除旧键
         for (size_t i = 0; i < tab_.indexes.size(); ++i) {
@@ -705,11 +705,9 @@ bool evaluate_condition(const Condition &cond, RmRecord *record) {
     char *lhs_data = record->data + lhs_col->offset;
 
     char *rhs_data = nullptr;
-    Value rhs_val;
     if (cond.is_rhs_val) {
-        rhs_val = cond.rhs_val;
-        rhs_val.init_raw(lhs_col->len);
-        rhs_data = rhs_val.raw->data;
+        // cond.rhs_val.raw 已在 analyze 阶段初始化，直接使用
+        rhs_data = cond.rhs_val.raw->data;
     } else {
         auto rhs_col = tab_.get_col(cond.rhs_col.col_name);
         rhs_data = record->data + rhs_col->offset;
@@ -772,11 +770,9 @@ void beginTuple() override {
                 }
             }
             if (is_index_col) {
-                // 用单列长度构建搜索键
-                Value val = cond.rhs_val;
-                val.init_raw(index_meta_.cols[0].len);
-                lower = ih->lower_bound(val.raw->data);
-                upper = ih->upper_bound(val.raw->data);
+                // cond.rhs_val.raw 已在 analyze 阶段初始化，直接使用
+                lower = ih->lower_bound(cond.rhs_val.raw->data);
+                upper = ih->upper_bound(cond.rhs_val.raw->data);
                 break;
             }
         }
@@ -882,8 +878,9 @@ python query_test_basic.py
 
 ### 12.2 常见运行时错误
 
+- **服务器卡死 100% CPU**: `open_db` 用 `DB_META_NAME`（相对路径）读 `db.meta`，但文件在数据库目录内 → ifstream 失败 → `operator>>` 读到未初始化的 `n` → 死循环。修复：用 `db_name + "/" + DB_META_NAME`
+- **Assertion `raw == nullptr` 崩溃**: `evaluate_condition` 中复制 `cond.rhs_val` 后又调用 `init_raw()`。`cond.rhs_val.raw` 已在 analyze 阶段初始化，不能再调用。修复：直接用 `cond.rhs_val.raw->data`
 - **空输出**: 忘记重写 is_end()。基类默认返回 true
-- **段错误**: evaluate_condition 中忘记调用 `rhs_val.init_raw(col_len)`
 - **行数不对**: beginTuple 没定位到第一条匹配，或 nextTuple 跳过了记录
 
 ### 12.3 调试策略
