@@ -134,6 +134,21 @@ Functions with `// Todo:` stubs in the source files are student exercises. Do no
 - POSIX I/O: `read`/`write`/`lseek`/`open`/`close`/`unlink`
 - Inspired by CMU 15-445 [BusTub](https://github.com/cmu-db/bustub) and Stanford CS346 [Redbase](https://web.stanford.edu/class/cs346/2015/redbase.html)
 
+### Parser (flex/bison) Regeneration
+
+After modifying `src/parser/lex.l` or `src/parser/yacc.y`, regenerate the C++ files:
+```bash
+cd src/parser
+flex --header-file=lex.yy.hpp -o lex.yy.cpp lex.l
+bison --defines=yacc.tab.hpp -o yacc.tab.cpp yacc.y
+```
+
+### Comment Conventions
+
+- `/** */` for doc blocks, `//` for inline comments
+- Use `@brief`, `@param`, `@return`, `@note`, `@see` tags
+- Avoid Chinese punctuation in code comments (use English punctuation)
+
 ## Known Issues
 
 ### General
@@ -165,6 +180,7 @@ The `docs/lciang_database_learning/` directory contains complete implementation 
 - `lab1/lab1_complete_guide.md` — Storage management (DiskManager, LRUReplacer, BPM, RmFileHandle, RmScan)
 - `lab2/lab2_complete_guide.md` — B+ tree index (22 TODOs, includes 5 bug fixes)
 - `lab2/lab2作业.docx` — Lab2 experiment report (module intro, background, implementation, testing, bugs, summary)
+- `lab3/lab3总结.md` — Lab3 experiment report (DDL, SeqScan, Projection, Insert/Delete/Update, NLJ, IndexScan, Sort)
 - `项目说明.md` — Project overview
 - `rucbase_learning_guide.md` — General learning guide
 
