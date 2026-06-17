@@ -113,10 +113,10 @@ Each data page: [RmPageHdr][bitmap][slots]. `RmPageHandle` provides typed access
 
 Functions with `// Todo:` stubs in the source files are student exercises. Do not implement them unless explicitly asked. The labs are:
 
-1. **Lab1 - Storage**: DiskManager, LRUReplacer, BufferPoolManager, RmFileHandle, RmScan (27 TODOs, currently STUBS)
-2. **Lab2 - Index**: B+ tree insert/delete/scan (22 TODOs, COMPLETED — src/system/sm_manager.cpp:3, src/index/ix_index_handle.cpp:20)
-3. **Lab3 - Query Execution**: Executor operators
-4. **Lab4 - Concurrency**: Transaction/lock management
+1. **Lab1 - Storage**: DiskManager, LRUReplacer, BufferPoolManager, RmFileHandle, RmScan — 24 TODOs STUBS (record file helpers already implemented)
+2. **Lab2 - Index**: B+ tree insert/delete/scan — COMPLETED (22 TODOs: src/index/ix_index_handle.cpp, src/system/sm_manager.cpp)
+3. **Lab3 - Query Execution**: Executor operators — COMPLETED (src/execution/, src/system/sm_manager.cpp DDL)
+4. **Lab4 - Concurrency**: Transaction/lock management — COMPLETED 100/100 (40/40 transaction + 60/60 concurrency). All TODOs done; rmdb.cpp uncommented; 11 bugs fixed.
 
 ## Code Modification Rules
 
@@ -174,6 +174,40 @@ These are NOT in the learning guide — they were discovered during debugging:
 - Implement in dependency order: IxNodeHandle (8 TODOs) → IxIndexHandle lookup (2) → insert (3) → delete (5) → range scan (2) → concurrency (3 locks)
 - After each group, rebuild and test the corresponding test binary
 
+### Lab4 Concurrency Control Pitfalls (10 bugs found during implementation)
+
+1. **`LockMode`/`GroupLockMode` are private enums**: Declared inside `LockManager` class as private. Cannot write standalone `static` helper functions in `.cpp` file — the types are inaccessible. Must inline compatibility checks directly into each lock function's body.
+
+2. **SmManager has no `get_rm_file_handle()`**: In `abort()` rollback, use `sm_manager_->fhs_.at(tab_name).get()` to get a raw `RmFileHandle*` pointer for undo operations.
+
+3. **Null txn guards required**: `rmdb.cpp` lines 121 and 183-186 are commented out by default. Every lock function needs `if (txn == nullptr) return true;`. Lock calls need `if (context != nullptr && context->txn_ != nullptr)` wrapper.
+
+4. **rmdb.cpp must be uncommented for testing**: Lines 121 (`SetTransaction`) and 183-186 (auto-commit) must be uncommented.
+
+5. **`txn_map.erase()` causes assertion failure**: After erase, `get_transaction` asserts txn_id exists. Fix: don't erase; keep COMMITTED/ABORTED txns in map for SetTransaction state check.
+
+6. **Iterator invalidation in commit/abort**: `unlock()` calls `lock_set->erase()` while iterating. Fix: copy lock_set before iterating.
+
+7. **write_set_ never populated**: Lab3 executors lack `append_write_record()`. Must add WriteRecord recording to InsertExecutor, DeleteExecutor, UpdateExecutor.
+
+8. **DELETE_TUPLE undo must restore to original rid**: `insert_record(buf)` allocates new slot → subsequent INSERT_TUPLE undo targets wrong rid. Fix: `insert_record(wr->GetRid(), wr->GetRecord().data)`.
+
+9. **UPDATE executor: DELETE_TUPLE + INSERT_TUPLE instead of UPDATE_TUPLE**: UpdateExecutor's delete+insert may change rid. Use two WriteRecords instead of one UPDATE_TUPLE.
+
+10. **Lock upgrade S→X MUST abort if other txns hold locks**: The upgrade path checked for the same txn's lock and upgraded without checking OTHER txns' granted locks. When txn1 and txn2 both hold S-locks on the same record, both could "upgrade" to X-locks silently — defeating write protection and causing all 5 write-related concurrency tests to fail. Fix: before upgrading, scan for any other txn's granted lock → if found, throw DEADLOCK_PREVENTION.
+
+11. **`insert_record` doesn't acquire X-lock**: Newly inserted records have zero lock protection. Fix: add `lock_exclusive_on_record` on the new rid after insertion.
+
+### Lab4 Test Commands
+```bash
+cd build && make rmdb -j$(nproc)
+cd ../src/test/transaction && python3 transaction_test.py    # 40 points (commit + abort)
+cd ../src/test/concurrency && python3 concurrency_test.py     # 60 points (6 isolation tests)
+# Single tests:
+python3 transaction_unit_test.py abort_test
+python3 concurrency_unit_test.py dirty_write_test
+```
+
 ## Learning Documents
 
 The `docs/lciang_database_learning/` directory contains complete implementation guides for each lab with directly copyable code:
@@ -181,6 +215,8 @@ The `docs/lciang_database_learning/` directory contains complete implementation 
 - `lab2/lab2_complete_guide.md` — B+ tree index (22 TODOs, includes 5 bug fixes)
 - `lab2/lab2作业.docx` — Lab2 experiment report (module intro, background, implementation, testing, bugs, summary)
 - `lab3/lab3总结.md` — Lab3 experiment report (DDL, SeqScan, Projection, Insert/Delete/Update, NLJ, IndexScan, Sort)
+- `lab4/lab4_complete_guide.md` — Lab4 concurrency control (TransactionManager 3 + LockManager 7 + 2PL integration, 11 bug fixes)
+- `lab4/lab4作业.md` — Lab4 experiment report (module intro, background, requirements, implementation, testing, 11 bugs, summary)
 - `项目说明.md` — Project overview
 - `rucbase_learning_guide.md` — General learning guide
 

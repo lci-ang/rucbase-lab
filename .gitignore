@@ -30,5 +30,11 @@ __pycache__/
 
 deps/
 
+# test database artifacts
+abort_test_db/
+build_test/
+concurrency_test_db/
+transaction_test_db/
+
 # 学习文档
 项目说明.md

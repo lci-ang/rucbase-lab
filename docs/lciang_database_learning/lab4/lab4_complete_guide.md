@@ -143,11 +143,11 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
 ```cpp
 void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // 1. 释放所有锁
-    auto lock_set = txn->get_lock_set();
-    for (auto &lock_data_id : *lock_set) {
+    // Bug fix: 先复制lock_set再遍历 — unlock内部会erase，直接遍历导致迭代器失效(segfault)
+    auto lock_ids = *txn->get_lock_set();
+    for (auto &lock_data_id : lock_ids) {
         lock_manager_->unlock(txn, lock_data_id);
     }
-    lock_set->clear();
     // 2. 清理写集（释放内存）
     auto write_set = txn->get_write_set();
     for (auto &write_record : *write_set) {
@@ -158,11 +158,9 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     log_manager->flush_log_to_disk();
     // 4. 更新状态
     txn->set_state(TransactionState::COMMITTED);
-    // 5. 从全局表移除
-    {
-        std::scoped_lock lock{latch_};
-        txn_map.erase(txn->get_transaction_id());
-    }
+    // 5. 从全局事务表中移除
+    // 注意：不删除txn_map条目！否则下次SetTransaction调get_transaction会断言失败
+    // 保留在map中，SetTransaction通过状态检查(COMMITTED)自动创建新事务
 }
 ```
 
@@ -181,35 +179,41 @@ void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
     auto write_set = txn->get_write_set();
     for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
         WriteRecord *wr = *it;
-        auto &fh = sm_manager_->get_rm_file_handle(wr->GetTableName());
+        // 注意：SmManager 没有 get_rm_file_handle() 方法，用 fhs_ map 直接访问
+        auto *fh = sm_manager_->fhs_.at(wr->GetTableName()).get();
         switch (wr->GetWriteType()) {
             case WType::INSERT_TUPLE:
                 fh->delete_record(wr->GetRid(), nullptr);    // 插入的要删掉
                 break;
             case WType::DELETE_TUPLE:
-                fh->insert_record(wr->GetRecord().data, nullptr);  // 删除的要恢复
+                // Bug fix: 必须恢复到原rid，否则后续INSERT_TUPLE回滚的delete_record会删错位置
+                fh->insert_record(wr->GetRid(), wr->GetRecord().data);
                 break;
             case WType::UPDATE_TUPLE:
-                fh->update_record(wr->GetRid(), wr->GetRecord().data, nullptr);  // 恢复旧值
+                // 注意：推荐在UpdateExecutor中用DELETE_TUPLE+INSERT_TUPLE替代UPDATE_TUPLE
+                // 因为delete+insert可能换rid，单独update_record无法处理这种情况
+                fh->delete_record(wr->GetRid(), nullptr);  // 先删除新记录
+                fh->insert_record(wr->GetRid(), wr->GetRecord().data);  // 再恢复旧记录
                 break;
         }
         delete wr;
     }
     write_set->clear();
-    // 2. 释放所有锁（必须在回滚之后！）
-    auto lock_set = txn->get_lock_set();
-    for (auto &lock_data_id : *lock_set) {
+    // 注意：不删除txn_map条目！理由同commit
+    // 2. 释放所有锁...
+    // Bug fix: 先复制lock_set再遍历 — unlock内部会erase
+    auto lock_ids = *txn->get_lock_set();
+    for (auto &lock_data_id : lock_ids) {
         lock_manager_->unlock(txn, lock_data_id);
     }
     lock_set->clear();
     // 3. 刷日志 + 更新状态
     log_manager->flush_log_to_disk();
     txn->set_state(TransactionState::ABORTED);
-    // 4. 从全局表移除
-    {
-        std::scoped_lock lock{latch_};
-        txn_map.erase(txn->get_transaction_id());
-    }
+    // 4. 从全局事务表中移除
+    // 注意：不删除txn_map条目！否则下次SetTransaction调get_transaction会断言失败
+    // 理由：get_transaction中对不存在的txn_id有assert，但commit/abort后txn_id未重置
+    // 保留在map中，SetTransaction通过状态检查(ABORTED)自动创建新事务
 }
 ```
 
@@ -221,77 +225,42 @@ void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
 
 **文件**：`src/transaction/concurrency/lock_manager.cpp`
 
-### 前置知识：两个辅助函数
+### 关键约束：LockMode / GroupLockMode 是 private enum
 
-在实现 7 个 TODO 之前，添加两个辅助函数：
-
-```cpp
-// 检查锁兼容性
-static bool is_lock_compatible(GroupLockMode granted_mode, LockMode request_mode) {
-    switch (request_mode) {
-        case LockMode::INTENTION_SHARED:
-            return granted_mode == GroupLockMode::NON_LOCK ||
-                   granted_mode == GroupLockMode::IS ||
-                   granted_mode == GroupLockMode::IX ||
-                   granted_mode == GroupLockMode::S;
-        case LockMode::INTENTION_EXCLUSIVE:
-            return granted_mode == GroupLockMode::NON_LOCK ||
-                   granted_mode == GroupLockMode::IS ||
-                   granted_mode == GroupLockMode::IX;
-        case LockMode::SHARED:
-            return granted_mode == GroupLockMode::NON_LOCK ||
-                   granted_mode == GroupLockMode::IS ||
-                   granted_mode == GroupLockMode::S;
-        case LockMode::EXLUCSIVE:  // 注意：框架代码拼写错误，保持原样
-            return granted_mode == GroupLockMode::NON_LOCK;
-        case LockMode::S_IX:
-            return granted_mode == GroupLockMode::NON_LOCK ||
-                   granted_mode == GroupLockMode::IS;
-        default:
-            return false;
-    }
-}
-
-// LockMode → GroupLockMode 映射
-static GroupLockMode get_group_lock_mode(LockMode mode) {
-    switch (mode) {
-        case LockMode::INTENTION_SHARED:    return GroupLockMode::IS;
-        case LockMode::INTENTION_EXCLUSIVE: return GroupLockMode::IX;
-        case LockMode::SHARED:              return GroupLockMode::S;
-        case LockMode::EXLUCSIVE:           return GroupLockMode::X;
-        case LockMode::S_IX:                return GroupLockMode::SIX;
-        default:                            return GroupLockMode::NON_LOCK;
-    }
-}
-```
+`lock_manager.h` 中 `LockMode` 和 `GroupLockMode` 定义在 `LockManager` 类的 **private** 区域。这意味着不能在 `.cpp` 文件中声明独立的 `static` 辅助函数（它们无法访问 private 类型）。**必须把兼容性检查直接内联到每个锁函数中**。
 
 ### 所有 7 个 TODO 的通用模式
 
 ```
-1. std::scoped_lock lock{latch_}    — 保护 lock_table_
-2. 构造 LockDataId                   — 唯一标识锁目标
-3. 在 lock_table_ 中查找/创建请求队列
-4. 检查该事务是否已持有此锁（避免重复授予）
-5. 检查兼容性（is_lock_compatible）
-   ├─ 兼容 → 授予锁，更新队列和事务的锁集
+1. if (txn == nullptr) return true;    — 事务未初始化时跳过（rmdb.cpp未启用时防崩溃）
+2. std::scoped_lock lock{latch_}       — 保护 lock_table_
+3. 构造 LockDataId                     — 唯一标识锁目标
+4. 在 lock_table_ 中查找/创建请求队列
+5. 检查该事务是否已持有此锁（避免重复授予）
+6. 检查兼容性（内联兼容矩阵判断）
+   ├─ 兼容 → 授予锁，更新队列和事务的 lock_set_
    └─ 冲突 → throw TransactionAbortException（No-Wait 策略）
 ```
 
 ### TODO 3.1：lock_shared_on_record（行级 S 锁）
 
-**位置**：第 20 行 | **调用场景**：读取某行数据时
+**位置**：第 58 行 | **调用场景**：读取某行数据时
 
 ```cpp
 bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
+    if (txn == nullptr) return true;  // 事务未初始化时跳过
     std::scoped_lock lock{latch_};
     LockDataId lock_data_id(tab_fd, rid, LockDataType::RECORD);
     auto &queue = lock_table_[lock_data_id];
-    // 检查是否已持有
+    // 检查是否已持有此锁
     for (auto &req : queue.request_queue_) {
         if (req.txn_id_ == txn->get_transaction_id() && req.granted_) return true;
     }
-    // 检查兼容性
-    if (!is_lock_compatible(queue.group_lock_mode_, LockMode::SHARED))
+    // 检查兼容性：S 锁兼容 NON_LOCK / IS / IX / S
+    if (queue.group_lock_mode_ != GroupLockMode::NON_LOCK &&
+        queue.group_lock_mode_ != GroupLockMode::IS &&
+        queue.group_lock_mode_ != GroupLockMode::IX &&
+        queue.group_lock_mode_ != GroupLockMode::S)
         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
     // 授予锁
     queue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::SHARED);
@@ -304,17 +273,19 @@ bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int ta
 
 ### TODO 3.2：lock_exclusive_on_record（行级 X 锁）
 
-**位置**：第 32 行 | **调用场景**：修改/删除某行数据时
+**位置**：第 84 行 | **调用场景**：修改/删除某行数据时
 
 ```cpp
 bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
+    if (txn == nullptr) return true;
     std::scoped_lock lock{latch_};
     LockDataId lock_data_id(tab_fd, rid, LockDataType::RECORD);
     auto &queue = lock_table_[lock_data_id];
     for (auto &req : queue.request_queue_) {
         if (req.txn_id_ == txn->get_transaction_id() && req.granted_) return true;
     }
-    if (!is_lock_compatible(queue.group_lock_mode_, LockMode::EXLUCSIVE))
+    // 检查兼容性：X 锁只兼容 NON_LOCK
+    if (queue.group_lock_mode_ != GroupLockMode::NON_LOCK)
         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
     queue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::EXLUCSIVE);
     queue.request_queue_.back().granted_ = true;
@@ -326,17 +297,20 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
 
 ### TODO 3.3：lock_shared_on_table（表级 S 锁）
 
-**位置**：第 43 行
-
 ```cpp
 bool LockManager::lock_shared_on_table(Transaction* txn, int tab_fd) {
+    if (txn == nullptr) return true;
     std::scoped_lock lock{latch_};
     LockDataId lock_data_id(tab_fd, LockDataType::TABLE);
     auto &queue = lock_table_[lock_data_id];
     for (auto &req : queue.request_queue_) {
         if (req.txn_id_ == txn->get_transaction_id() && req.granted_) return true;
     }
-    if (!is_lock_compatible(queue.group_lock_mode_, LockMode::SHARED))
+    // S 锁兼容 NON_LOCK / IS / IX / S
+    if (queue.group_lock_mode_ != GroupLockMode::NON_LOCK &&
+        queue.group_lock_mode_ != GroupLockMode::IS &&
+        queue.group_lock_mode_ != GroupLockMode::IX &&
+        queue.group_lock_mode_ != GroupLockMode::S)
         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
     queue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::SHARED);
     queue.request_queue_.back().granted_ = true;
@@ -349,78 +323,44 @@ bool LockManager::lock_shared_on_table(Transaction* txn, int tab_fd) {
 
 ### TODO 3.4：lock_exclusive_on_table（表级 X 锁）
 
-**位置**：第 54 行
-
 ```cpp
 bool LockManager::lock_exclusive_on_table(Transaction* txn, int tab_fd) {
-    std::scoped_lock lock{latch_};
-    LockDataId lock_data_id(tab_fd, LockDataType::TABLE);
-    auto &queue = lock_table_[lock_data_id];
-    for (auto &req : queue.request_queue_) {
-        if (req.txn_id_ == txn->get_transaction_id() && req.granted_) return true;
-    }
-    if (!is_lock_compatible(queue.group_lock_mode_, LockMode::EXLUCSIVE))
-        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
-    queue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::EXLUCSIVE);
-    queue.request_queue_.back().granted_ = true;
-    queue.group_lock_mode_ = GroupLockMode::X;
-    txn->get_lock_set()->insert(lock_data_id);
-    return true;
+    if (txn == nullptr) return true;
+    // 其余同模式，只是 LockDataType::TABLE 和兼容性检查不同
+    // X 锁只兼容 NON_LOCK
+    ...
 }
 ```
 
 ### TODO 3.5：lock_IS_on_table（表级 IS 锁）
 
-**位置**：第 65 行
-
 ```cpp
 bool LockManager::lock_IS_on_table(Transaction* txn, int tab_fd) {
-    std::scoped_lock lock{latch_};
-    LockDataId lock_data_id(tab_fd, LockDataType::TABLE);
-    auto &queue = lock_table_[lock_data_id];
-    for (auto &req : queue.request_queue_) {
-        if (req.txn_id_ == txn->get_transaction_id() && req.granted_) return true;
-    }
-    if (!is_lock_compatible(queue.group_lock_mode_, LockMode::INTENTION_SHARED))
-        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
-    queue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::INTENTION_SHARED);
-    queue.request_queue_.back().granted_ = true;
-    if (queue.group_lock_mode_ == GroupLockMode::NON_LOCK)
-        queue.group_lock_mode_ = GroupLockMode::IS;
-    txn->get_lock_set()->insert(lock_data_id);
-    return true;
+    if (txn == nullptr) return true;
+    // IS 锁兼容 NON_LOCK / IS / IX / S
+    // 授予后若队列为空 → group_lock_mode_ = IS
+    ...
 }
 ```
 
 ### TODO 3.6：lock_IX_on_table（表级 IX 锁）
 
-**位置**：第 76 行
-
 ```cpp
 bool LockManager::lock_IX_on_table(Transaction* txn, int tab_fd) {
-    std::scoped_lock lock{latch_};
-    LockDataId lock_data_id(tab_fd, LockDataType::TABLE);
-    auto &queue = lock_table_[lock_data_id];
-    for (auto &req : queue.request_queue_) {
-        if (req.txn_id_ == txn->get_transaction_id() && req.granted_) return true;
-    }
-    if (!is_lock_compatible(queue.group_lock_mode_, LockMode::INTENTION_EXCLUSIVE))
-        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
-    queue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::INTENTION_EXCLUSIVE);
-    queue.request_queue_.back().granted_ = true;
-    if (queue.group_lock_mode_ == GroupLockMode::NON_LOCK || queue.group_lock_mode_ == GroupLockMode::IS)
-        queue.group_lock_mode_ = GroupLockMode::IX;
-    txn->get_lock_set()->insert(lock_data_id);
-    return true;
+    if (txn == nullptr) return true;
+    // IX 锁兼容 NON_LOCK / IS / IX
+    // 授予后若队列为 NON_LOCK 或 IS → group_lock_mode_ = IX
+    ...
 }
 ```
 
 ### TODO 3.7：unlock（释放锁）
 
-**位置**：第 87 行
+**位置**：第 200 行
 
 ```cpp
 bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
+    if (txn == nullptr) return true;
     std::scoped_lock lock{latch_};
     auto it = lock_table_.find(lock_data_id);
     if (it == lock_table_.end()) return false;
@@ -432,22 +372,36 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
             break;
         }
     }
-    // 重新计算组锁模式
+    // 重新计算组锁模式：遍历剩余请求，取最强锁模式
     queue.group_lock_mode_ = GroupLockMode::NON_LOCK;
     for (auto &req : queue.request_queue_) {
         if (req.granted_) {
-            GroupLockMode mode = get_group_lock_mode(req.lock_mode_);
-            if (static_cast<int>(mode) > static_cast<int>(queue.group_lock_mode_))
-                queue.group_lock_mode_ = mode;
+            switch (req.lock_mode_) {
+                case LockMode::EXLUCSIVE:
+                    queue.group_lock_mode_ = GroupLockMode::X; break;
+                case LockMode::S_IX:
+                    if (queue.group_lock_mode_ != GroupLockMode::X) queue.group_lock_mode_ = GroupLockMode::SIX; break;
+                case LockMode::SHARED:
+                    if (queue.group_lock_mode_ != GroupLockMode::X && queue.group_lock_mode_ != GroupLockMode::SIX)
+                        queue.group_lock_mode_ = GroupLockMode::S; break;
+                case LockMode::INTENTION_EXCLUSIVE:
+                    if (queue.group_lock_mode_ == GroupLockMode::NON_LOCK || queue.group_lock_mode_ == GroupLockMode::IS)
+                        queue.group_lock_mode_ = GroupLockMode::IX; break;
+                case LockMode::INTENTION_SHARED:
+                    if (queue.group_lock_mode_ == GroupLockMode::NON_LOCK)
+                        queue.group_lock_mode_ = GroupLockMode::IS; break;
+                default: break;
+            }
         }
     }
-    // 从事务的锁集中移除
     txn->get_lock_set()->erase(lock_data_id);
     return true;
 }
 ```
 
-**为什么重算 `group_lock_mode_`**：移除请求后，队列中剩余锁的最强模式可能变化。例如两个 S 锁移除一个后，仍然是 S；两个都移除后，变为 NON_LOCK。
+**为什么重算 `group_lock_mode_`**：移除请求后，队列中剩余锁的最强模式可能变化。不能再用 `get_group_lock_mode` 辅助函数（private enum 不可访问），改用 switch 内联判断。
+
+**为什么每个函数都加 `if (txn == nullptr) return true`**：`rmdb.cpp` 中 `SetTransaction` 被注释时 `context->txn_` 为 nullptr。不加保护会导致空指针崩溃（segfault）。加保护后，无事务时跳过锁逻辑，不影响普通 SQL 执行。
 
 ---
 
@@ -483,10 +437,12 @@ if(context->txn_->get_txn_mode() == false)
 
 ### 4.3 rm_file_handle.cpp — get_record 加 S 锁
 
-在 `get_record` 函数开头添加：
+在 `get_record` 函数开头（TODO 注释后）添加：
 
 ```cpp
-context->lock_mgr_->lock_shared_on_record(context->txn_, rid, fd_);
+// 加行级S锁（context为空或txn未初始化时跳过）
+if (context != nullptr && context->txn_ != nullptr)
+    context->lock_mgr_->lock_shared_on_record(context->txn_, rid, fd_);
 ```
 
 ### 4.4 rm_file_handle.cpp — delete_record 和 update_record 加 X 锁
@@ -494,7 +450,9 @@ context->lock_mgr_->lock_shared_on_record(context->txn_, rid, fd_);
 在 `delete_record` 和 `update_record` 函数开头分别添加：
 
 ```cpp
-context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fd_);
+// 加行级X锁（context为空或txn未初始化时跳过）
+if (context != nullptr && context->txn_ != nullptr)
+    context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fd_);
 ```
 
 **完整的锁流程示例**：
@@ -512,6 +470,71 @@ T2: UPDATE student SET name='Alice' WHERE id=1; (T1 未提交时)
   → 检查兼容性：队列有 T1 的 S 锁，X 与 S 不兼容
   → throw TransactionAbortException → T2 被 abort
 ```
+
+### 4.5 executor 中维护 write_set（3 个文件）
+
+**重要**：事务回滚依赖 `write_set_`，但 Lab3 的执行器不记录写操作。必须在三个执行器中添加 `append_write_record` 调用。
+
+#### InsertExecutor (`executor_insert.h`)
+
+在 `fh_->insert_record()` 之后添加：
+
+```cpp
+// 记录写操作到write_set，用于回滚
+if (context_->txn_ != nullptr) {
+    context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_));
+}
+```
+
+#### DeleteExecutor (`executor_delete.h`)
+
+在 `fh_->get_record()` 之后、删除之前添加：
+
+```cpp
+// 记录写操作到write_set，用于回滚（必须在删除前保存旧值）
+if (context_->txn_ != nullptr) {
+    context_->txn_->append_write_record(new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *record));
+}
+```
+
+#### UpdateExecutor (`executor_update.h`)
+
+**关键发现**：UpdateExecutor 中 `delete_record(old_rid)` + `insert_record(new_rid)` 可能导致 rid 变化。如果只记录一个 `UPDATE_TUPLE` WriteRecord（含 old_rid），回滚时无法找到 new_rid 上的新记录。
+
+**正确做法**：记录两个 WriteRecord — `DELETE_TUPLE`(旧记录) + `INSERT_TUPLE`(新记录)：
+
+```cpp
+// 删除旧记录，插入新记录
+fh_->delete_record(rid, context_);
+Rid new_rid = fh_->insert_record(new_record.data, context_);
+// 记录写操作到write_set — 注意顺序！
+// 回滚时逆序处理：先delete_record(new_rid)，再insert_record(rid, old_data)
+if (context_->txn_ != nullptr) {
+    context_->txn_->append_write_record(new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *old_record));
+    context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, new_rid));
+}
+```
+
+### 4.6 锁升级（Lock Upgrade）
+
+**关键发现**：当同一事务先获取 S 锁再获取 X 锁时，直接 `return true` 跳过兼容性检查会导致 `group_lock_mode_` 不更新（仍为 S），其他事务仍能获取 S 锁，导致写冲突检测失效。
+
+在每个 X 锁函数中，处理"已有锁"时需要检查并升级：
+
+```cpp
+for (auto &req : queue.request_queue_) {
+    if (req.txn_id_ == txn->get_transaction_id() && req.granted_) {
+        // 锁升级：如果已有S锁，升级为X锁
+        if (req.lock_mode_ == LockMode::SHARED) {
+            req.lock_mode_ = LockMode::EXLUCSIVE;
+            queue.group_lock_mode_ = GroupLockMode::X;
+        }
+        return true;
+    }
+}
+```
+
+同样适用于 `lock_exclusive_on_table`（IS/IX/S → X）。
 
 ---
 
@@ -606,11 +629,21 @@ gdb ./build/rmdb
 | rmdb 启动崩溃 | `SetTransaction` 未取消注释 | 取消 rmdb.cpp 第 121 行注释 |
 | 单条 SQL 后 select 看不到结果 | auto-commit 未启用 | 取消 rmdb.cpp 第 183-186 行注释 |
 | dirty_read_test 失败 | `get_record` 未加 S 锁 | 在 get_record 开头调用 lock_shared_on_record |
-| dirty_write_test 失败 | `update_record` 未加 X 锁 | 在 update_record 开头调用 lock_exclusive_on_record |
+| dirty_write_test / lost_update_test / unrepeatable_read_test 失败 | 锁升级(S→X)未检查其他事务的锁，导致两事务同时持有X锁 | 升级前遍历队列：若有其他事务的 granted 锁则 throw DEADLOCK_PREVENTION |
+| concurrency_read_test 通过但写测试全失败 | `insert_record` 不加锁，新记录无保护 | insert_record 返回前对新 rid 加 X 锁 |
 | abort_test 失败 | write_set_ 未正确记录 | 检查 executor 中的 append_write_record 调用 |
 | 测试卡住 | unlock 未正确释放 | 检查 commit/abort 中的锁释放循环 |
 | 不可重复读测试失败 | S 锁在读取后立即释放 | S 锁必须持有到事务结束（commit/abort 时才释放） |
 | 丢失更新测试失败 | 读取时未加锁 | 读取也必须加 S 锁 |
+| lock_manager.cpp 编译报 `GroupLockMode was not declared` | LockMode/GroupLockMode 是 private enum | 不能写独立的 static 辅助函数，须把兼容性判断内联到每个锁函数中 |
+| `'class SmManager' has no member named 'get_rm_file_handle'` | SmManager 无此方法 | 改用 `sm_manager_->fhs_.at(tab_name).get()` |
+| rmdb 段错误 (nullptr dereference) | txn 未初始化就调用了 lock 函数 | 每个 lock 函数开头加 `if (txn == nullptr) return true`，lock 调用处也加 context 非空判断 |
+| commit/abort 后在 "select..." 时服务器崩溃 (assertion failed) | `get_transaction` 对已删除的 txn_id 触发 assert；根源是 commit/abort 中 `txn_map.erase()` 删除了事务但 `txn_id` 未重置 | **不在 commit/abort 中调用 `txn_map.erase()`**。保留已提交/已回滚的事务在 map 中，`SetTransaction` 会通过状态检查(`COMMITTED`/`ABORTED`)自动创建新事务 |
+| commit 时 segfault (核心已转储) | `commit()` 遍历 `lock_set` 时 `unlock()` 内部调用 `lock_set->erase()`，导致迭代器失效 | 先复制 lock_set 再遍历：`auto lock_ids = *txn->get_lock_set()` |
+| abort_test 失败，数据未回滚 | `write_set_` 从未被填充 — 执行器未调用 `append_write_record()` | 在 InsertExecutor、DeleteExecutor、UpdateExecutor 中添加 WriteRecord 记录 |
+| abort 后数据出现重复行（同一记录出现两次） | `DELETE_TUPLE` 回滚使用 `insert_record(buf)` 分配了新 rid，旧 INSERT WriteRecord 的 `delete_record(old_rid)` 删错位置 | 用 `insert_record(wr->GetRid(), wr->GetRecord().data)` 恢复到原 rid |
+| abort 后 UPDATE 的数据仍显示新值 | UpdateExecutor 中 `delete_record`+`insert_record` 可能产生不同 rid，单个 UPDATE_TUPLE WriteRecord 无法追踪新 rid | 在 UpdateExecutor 中用 `DELETE_TUPLE`(旧记录) + `INSERT_TUPLE`(新记录) 两个 WriteRecord 替代一个 UPDATE_TUPLE |
+| 脏写/脏读测试失败，写冲突未检测到 | 事务 S→X 锁升级时，`lock_exclusive_on_record` 仅 `return true` 未更新 `group_lock_mode_`，其他事务检测到的组锁模式仍为 S | 在 X 锁函数中检测已有 S 锁时，同时更新 `req.lock_mode_ = LockMode::EXLUCSIVE` 和 `queue.group_lock_mode_ = GroupLockMode::X` |
 
 ---
 

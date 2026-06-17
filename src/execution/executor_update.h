@@ -66,6 +66,13 @@ class UpdateExecutor : public AbstractExecutor {
             // 删除旧记录，插入新记录
             fh_->delete_record(rid, context_);
             Rid new_rid = fh_->insert_record(new_record.data, context_);
+            // 记录写操作到write_set，用于回滚
+            // 注意：先用DELETE_TUPLE保存旧记录(rid)，再用INSERT_TUPLE标记新记录(new_rid)
+            // 回滚时逆序处理：先删除新记录，再恢复旧记录
+            if (context_->txn_ != nullptr) {
+                context_->txn_->append_write_record(new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *old_record));
+                context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, new_rid));
+            }
             // 将新键插入索引
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto &index = tab_.indexes[i];

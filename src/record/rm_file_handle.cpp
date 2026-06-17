@@ -20,6 +20,8 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
     // Todo:
     // 1. 获取指定记录所在的page handle
     // 2. 初始化一个指向RmRecord的指针（赋值其内部的data和size）
+    // 加行级S锁
+    if (context != nullptr && context->txn_ != nullptr) context->lock_mgr_->lock_shared_on_record(context->txn_, rid, fd_);
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
@@ -52,7 +54,11 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
     }
     PageId page_id = {fd_, page_handle.page->get_page_id().page_no};
     buffer_pool_manager_->unpin_page(page_id, true);
-    return Rid{page_handle.page->get_page_id().page_no, slot_no};
+    Rid result_rid{page_handle.page->get_page_id().page_no, slot_no};
+    // 加行级X锁：保护新插入的记录，防止其他事务脏读或脏写
+    if (context != nullptr && context->txn_ != nullptr)
+        context->lock_mgr_->lock_exclusive_on_record(context->txn_, result_rid, fd_);
+    return result_rid;
 }
 
 /**
@@ -79,6 +85,8 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
     // 1. 获取指定记录所在的page handle
     // 2. 更新page_handle.page_hdr中的数据结构
     // 注意考虑删除一条记录后页面未满的情况，需要调用release_page_handle()
+    // 加行级X锁
+    if (context != nullptr && context->txn_ != nullptr) context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fd_);
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     Bitmap::reset(page_handle.bitmap, rid.slot_no);
     page_handle.page_hdr->num_records--;
@@ -100,6 +108,8 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
     // Todo:
     // 1. 获取指定记录所在的page handle
     // 2. 更新记录
+    // 加行级X锁
+    if (context != nullptr && context->txn_ != nullptr) context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fd_);
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     memcpy(page_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
     PageId page_id = {fd_, rid.page_no};
